@@ -141,17 +141,14 @@ class TritonLinearFunction(torch.autograd.Function):
 
 def triton_linear(input: torch.Tensor,
                   weight: torch.Tensor,
-                  bias: torch.Tensor = None,
-                  BLOCK=(128,64,32)) -> torch.Tensor:
-    return TritonLinearFunction.apply(input, weight, bias, BLOCK)
+                  bias: torch.Tensor = None) -> torch.Tensor:
+    return TritonLinearFunction.apply(input, weight, bias)
 
 # --- Kronecker Linear via two Triton calls ---
 def triton_kron_linear(input: torch.Tensor,
                        A: torch.Tensor,
                        B: torch.Tensor,
-                       bias: torch.Tensor = None,
-                       BLOCK_B=(64,64,64),
-                       BLOCK_A=(64,64,64)) -> torch.Tensor:
+                       bias: torch.Tensor = None) -> torch.Tensor:
     """
     Linear layer where weight = kron(A, B).
     Args:
@@ -167,10 +164,10 @@ def triton_kron_linear(input: torch.Tensor,
     assert dim_in == IA * IB, "Input dim mismatch"
     # Step 1: apply B -> reshape input to [batch*IA, IB]
     x = input.view(batch, IA, IB).reshape(batch * IA, IB)
-    y1 = triton_linear_forward(x, B, None, BLOCK_B)  # [batch*IA, OB]
+    y1 = triton_linear_forward(x, B)  # [batch*IA, OB]
     # Step 2: apply A -> reshape to [batch, IA, OB] -> permute to [batch*OB, IA]
     y1 = y1.view(batch, IA, OB).permute(0, 2, 1).reshape(batch * OB, IA)
-    y2 = triton_linear_forward(y1, A, None, BLOCK_A)  # [batch*OB, OA]
+    y2 = triton_linear_forward(y1, A)  # [batch*OB, OA]
     # Reshape back and flatten
     y2 = y2.view(batch, OB, OA).permute(0, 2, 1).reshape(batch, OA * OB)
     if bias is not None:
