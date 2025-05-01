@@ -1,0 +1,32 @@
+{
+    "model_config": {
+        "model_name_or_path": "gpt2",
+        "factor_dim": 16
+    },
+    "training_config": {
+        "output_dir": "./outputs/gpt2-kronecker",
+        "num_train_epochs": 3,
+        "per_device_train_batch_size": 8,
+        "per_device_eval_batch_size": 8,
+        "gradient_accumulation_steps": 4,
+        "learning_rate": 5e-5,
+        "warmup_steps": 500,
+        "weight_decay": 0.01,
+        "logging_steps": 100,
+        "evaluation_strategy": "steps",
+        "eval_steps": 500,
+        "save_steps": 1000,
+        "save_total_limit": 2,
+        "fp16": true
+    },
+    "dataset_config": {
+        "dataset_name": "wikitext",
+        "dataset_config_name": "wikitext-2-raw-v1",
+        "max_seq_length": 128,
+        "preprocessing_num_workers": 4
+    },
+    "distillation_config": {
+        "alpha": 0.5,
+        "temperature": 2.0
+    }
+} 
