@@ -2,7 +2,8 @@ import triton
 import triton.language as tl
 import torch
 import math
-
+from typing import Optional, Tuple
+import torch.nn as nn
 # Default tile sizes for grid computation
 DEFAULT_BLOCK_M = 128
 DEFAULT_BLOCK_N = 64
@@ -18,17 +19,21 @@ DEFAULT_BLOCK_N = 64
 )
 @triton.jit
 def linear_kernel(
-    x_ptr, w_ptr, a_kron_factor_ptr, b_kron_factor_ptr, bias_ptr, out_ptr,
+    x_ptr, a_kron_factor_ptr, b_kron_factor_ptr, bias_ptr, out_ptr,
     M, K, N, b_Kron_factor_N, b_Kron_factor_K, 
     sxm, sxk,
-    swk, swn,
-    sb,
+    sak, san, # strides for a_kron_factor.transpose
+    sbk,sbn,  # strides for b_kron_factor.transpose
+    sb, # stride for bias
     som, son,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    import pdb; pdb.set_trace()
+
+
+
+    #import pdb; pdb.set_trace()
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -88,116 +93,155 @@ def linear_kernel(
 
 
 
-def efficient_kronecker_linear(x, weight, bias):
+def efficient_kronecker_linear(x, a_kron_factor,b_kron_factor, bias):
     """Launch Triton linear kernel"""
     M, K = x.shape
-    N, _ = weight.shape
+    N = a_kron_factor.shape[1] * b_kron_factor.shape[1]
+    b_Kron_factor_N = b_kron_factor.shape[0] 
+    b_Kron_factor_K = b_kron_factor.shape[1]  
     out = torch.empty((M, N), device=x.device, dtype=x.dtype)
     grid = (triton.cdiv(M, DEFAULT_BLOCK_M), triton.cdiv(N, DEFAULT_BLOCK_N))
     linear_kernel[grid](
-        x, weight, bias, out,
-        M, K, N,
+        x, a_kron_factor, b_kron_factor, bias, out,
+        M, K, N, b_Kron_factor_N, b_Kron_factor_K,
         x.stride(0), x.stride(1),
-        weight.stride(1), weight.stride(0),
+        a_kron_factor.stride(1), a_kron_factor.stride(0),
+        b_kron_factor.stride(1), b_kron_factor.stride(0),
         bias.stride(0),
-        out.stride(0), out.stride(1),
+        out.stride(0), out.stride(1)
     )
     return out
 
 
 class TritonKroneckerLinearFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, bias):
-        ctx.save_for_backward(x, weight)
-        return efficient_kronecker_slinear(x, weight, bias)
-
+    def forward(ctx, x, a_kron_factor, b_kron_factor, bias):
+        ctx.save_for_backward(x, a_kron_factor, b_kron_factor)
+        return efficient_kronecker_linear(x, a_kron_factor, b_kron_factor, bias)
     @staticmethod
     def backward(ctx, grad_out):
-        x, weight = ctx.saved_tensors
-        grad_bias = grad_out.sum(dim=0)
-        grad_weight = torch.matmul(grad_out.t(), x)
-        grad_x = torch.matmul(grad_out, weight)
-        return grad_x, grad_weight, grad_bias
+        raise NotImplementedError("Backward for TritonKroneckerLinear not yet implemented")
+    # @staticmethod
+    # def backward(ctx, grad_out):
+    #     x, a_kron_factor, b_kron_factor = ctx.saved_tensors
+    #     grad_bias = grad_out.sum(dim=0)
+    #     grad_a_kron_factor = torch.matmul(grad_out.t(), x)
+    #     grad_b_kron_factor = torch.matmul(grad_out, a_kron_factor)
+    #     return grad_x, grad_weight, grad_bias
 
 
 class TritonKroneckerLinear(torch.nn.Module):
-    def __init__(self, in_features, out_features, bias=True):
+        
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        in_factors: Optional[Tuple[int, int]] = None,
+        out_factors: Optional[Tuple[int, int]] = None,
+        bias: bool = True,
+        device=None,
+        dtype=None
+        ):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features))
-        if bias:
-            self.bias = torch.nn.Parameter(torch.empty(out_features))
-        else:
-            self.register_parameter('bias', None)
-        self.reset_parameters()
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        
+        # Validate that factors multiply to the correct dimensions
+        if in_factors[0] * in_factors[1] != in_features:
+            raise ValueError(f"in_factors {in_factors} must multiply to in_features {in_features}")
+        if out_factors[0] * out_factors[1] != out_features:
+            raise ValueError(f"out_factors {out_factors} must multiply to out_features {out_features}")
+        
+        # Descriptive factor naming
+        self.in_factor1, self.in_factor2 = in_factors
+        self.out_factor1, self.out_factor2 = out_factors
 
+        # Initialize Kronecker factors; shapes: (out_factor, in_factor)
+        self.kn_factor_A = nn.Parameter(torch.empty((self.out_factor1, self.in_factor1), device=device, dtype=dtype))
+        self.kn_factor_B = nn.Parameter(torch.empty((self.out_factor2, self.in_factor2), device=device, dtype=dtype))
+        # Bias parameter
+        self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype)) if bias else None
+        self.reset_parameters()
+        
     def reset_parameters(self):
-        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        """Initialize the Kronecker factors using Kaiming uniform initialization."""
+        nn.init.kaiming_uniform_(self.kn_factor_A, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.kn_factor_B, a=math.sqrt(5))
         if self.bias is not None:
-            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight)
+            fan_in = self.in_features
             bound = 1 / math.sqrt(fan_in)
-            torch.nn.init.uniform_(self.bias, -bound, bound)
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x):
-        return TritonKroneckerLinearFunction.apply(x, self.weight, self.bias)
+        return TritonKroneckerLinearFunction.apply(x, self.kn_factor_A, self.kn_factor_B , self.bias)
 
 
-# Validation and Benchmark
 
-def validate_correctness(M=512, K=256, N=512, rtol=1e-3, atol=1e-2):
-    device = 'cuda'
-    x = torch.randn((M, K), device=device)
-    w = torch.randn((N, K), device=device)
-    b = torch.randn((N,), device=device)
-    out_t = TritonLinearFunction.apply(x, w, b)
-    out_p = torch.nn.functional.linear(x, w, b)
-    diff = (out_t - out_p).abs()
-    tol = atol + rtol * out_p.abs()
-    fails = (diff > tol).sum().item()
-    total = diff.numel()
-    perc = fails / total * 100
-    print(f"Validation: {fails}/{total} ({perc:.2f}%) elements exceed tol")
+    @staticmethod
+    def benchmark_kronecker_linear():
+        """
+        Benchmark KroneckerLinear layer against standard linear layer with Kronecker product.
+        Compares computation time and memory usage.
+        """
+        import time
+        import torch
+        
+        # Set random seed for reproducibility
+        torch.manual_seed(42)
+        
+        # Test dimensions
+        in_features = 100
+        out_features = 100
+        batch_size = 32
+        
+        # Create random input
+        x = torch.randn(batch_size, in_features)
+        
+        # Method 1: Using KroneckerLinear
+        kron_linear = TritonKroneckerLinear(
+            in_features=in_features,
+            out_features=out_features,
+            in_factors=(50, 2),
+            out_factors=(50, 2),
+            bias=True
+        )
+        
+        # Method 2: Using standard linear with Kronecker product
+        # Create random factors
+        m1, n1 = kron_linear.out_factor1, kron_linear.in_factor1
+        m2, n2 = kron_linear.out_factor2, kron_linear.in_factor2
+        
+        A = kron_linear.kn_factor_A.view(m1, n1)
+        B = kron_linear.kn_factor_B.view(m2, n2)
+        
+        # Compute full weight matrix using Kronecker product
+        W = torch.kron(A, B)
+        linear = torch.nn.Linear(in_features, out_features)
+        linear.weight.data = W
+        
+        # Benchmark KroneckerLinear
+        start_time = time.time()
+        for _ in range(100):
+            y1 = kron_linear(x)
+        kron_time = (time.time() - start_time) / 100
+        
+        # Benchmark standard linear
+        start_time = time.time()
+        for _ in range(100):
+            y2 = linear(x)
+        linear_time = (time.time() - start_time) / 100
+        
+        # Compare outputs to ensure they are acceptably close
+        max_diff = torch.max(torch.abs(y1 - y2))
+        print(f"Maximum difference between outputs: {max_diff:.6f}")
+        print(f"KroneckerLinear time: {kron_time:.6f}s")
+        print(f"Standard linear time: {linear_time:.6f}s")
+        print(f"Speedup factor: {linear_time/kron_time:.2f}x")
 
+def __main__():
+    TritonKroneckerLinear.benchmark_kronecker_linear()
 
-def benchmark(M=2048, K=1024, N=2048, runs=50, warmup=10):
-    device = 'cuda'
-    x = torch.randn((M, K), device=device)
-    w = torch.randn((N, K), device=device)
-    b = torch.randn((N,), device=device)
+if __name__ == "__main__":
+    __main__()
 
-    # Prepare models
-    torch_lin = torch.nn.Linear(K, N).to(device)
-    torch_lin_comp = torch.compile(torch_lin)
-    triton_lin = TritonLinear(K, N).to(device)
-    triton_lin_comp = torch.compile(triton_lin)
-
-    # Warmup
-    for _ in range(warmup):
-        _ = torch_lin(x)
-        _ = torch_lin_comp(x)
-        _ = TritonLinearFunction.apply(x, w, b)
-        _ = triton_lin_comp(x)
-
-    # Benchmark
-    def time_fn(fn):
-        torch.cuda.synchronize(); start = torch.cuda.Event(True); end = torch.cuda.Event(True)
-        start.record()
-        for _ in range(runs): fn(x)
-        end.record(); torch.cuda.synchronize()
-        return start.elapsed_time(end) / runs
-
-    t_torch = time_fn(torch_lin)
-    t_torch_comp = time_fn(torch_lin_comp)
-    t_triton = time_fn(lambda inp: TritonLinearFunction.apply(inp, w, b))
-    t_triton_comp = time_fn(triton_lin_comp)
-
-    print(f"Torch         : {t_torch:.3f} ms")
-    print(f"Torch Compiled: {t_torch_comp:.3f} ms")
-    print(f"Triton        : {t_triton:.3f} ms")
-    print(f"Triton Compiled: {t_triton_comp:.3f} ms")
-
-
-if __name__ == '__main__':
-    print("Running validation...")
-    validate_correctness()
-    print("\nRunning benchmark...")
-    benchmark()

@@ -199,44 +199,39 @@ class KroneckerLinear(nn.Module):
         return A_factors, B_factors
     
     @classmethod
-    def from_linear(cls, linear: nn.Linear, num_sum: int = 1, efficient_sum: bool = True) -> 'KroneckerLinear':
+    def from_linear_with_factors(
+        cls,
+        linear: nn.Linear,
+        out_factors: Tuple[int,int],
+        in_factors: Tuple[int,int],
+        num_sum: int = 1,
+        efficient_sum: bool = True,
+    ) -> 'KroneckerLinear':
         """
-        Initialize a KroneckerLinear layer from an existing nn.Linear layer.
-        
-        This method performs an SVD-based decomposition of the linear layer's weight matrix to
-        find the nearest Kronecker product representation.
-        
-        Args:
-            linear: The torch.nn.Linear layer to convert.
-            num_sum: Number of summation terms (components) for the Kronecker decomposition.
-            efficient_sum: Whether to use the efficient summation implementation.
-        
-        Returns:
-            A KroneckerLinear layer initialized from the given linear layer.
+        Initialize from an existing nn.Linear, but *force* the Kronecker-factor
+        shapes to out_factors (m1,m2) and in_factors (n1,n2).
         """
-        in_features = linear.in_features
-        out_features = linear.out_features
-        has_bias = (linear.bias is not None)
-        
-        # Instantiate a new KroneckerLinear layer.
+        m1, m2 = out_factors
+        n1, n2 = in_factors
+        has_bias = linear.bias is not None
+
+        # instantiate with your chosen factors
         kron_layer = cls(
-            in_features=in_features,
-            out_features=out_features,
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            in_factors=(n1,n2),
+            out_factors=(m1,m2),
             bias=has_bias,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
             num_sum=num_sum,
-            efficient_sum=efficient_sum
+            efficient_sum=efficient_sum,
         )
-        # Obtain the full weight from the linear layer (shape: [out_features, in_features])
+
         W = linear.weight.data
-        # Factor dimensions from the new layer
-        m1, n1 = kron_layer.out_factor1, kron_layer.in_factor1
-        m2, n2 = kron_layer.out_factor2, kron_layer.in_factor2
-        # Use SVD to initialize the Kronecker factors
         kn_A, kn_B = cls._svd_nearest_kron(W, m1, n1, m2, n2, num_sum)
-        kron_layer.kn_factor_A.data = kn_A
-        kron_layer.kn_factor_B.data = kn_B
+        kron_layer.kn_factor_A.data.copy_(kn_A)
+        kron_layer.kn_factor_B.data.copy_(kn_B)
         if has_bias:
             kron_layer.bias.data.copy_(linear.bias.data)
         return kron_layer
