@@ -47,7 +47,9 @@ python examples/scripts/gkd.py \
 
 from accelerate import PartialState
 from datasets import load_dataset
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import AutoTokenizer, GenerationConfig, AutoModelForCausalLM
+from kronecker.layers.kronecker_linear import  KroneckerLinear
+from kronecker.utils.conversion import replace_linears_with_kron
 
 from trl import (
     GKDConfig,
@@ -88,7 +90,17 @@ if __name__ == "__main__":
     )
 
 
+    teacher_model_kwargs = dict(
+        revision=model_args.model_revision,
+        trust_remote_code=model_args.trust_remote_code,
+        attn_implementation=model_args.attn_implementation,
+        torch_dtype=model_args.torch_dtype,
+        use_cache=False if training_args.gradient_checkpointing else True,
+        device_map=get_kbit_device_map() if quantization_config is not None else None,
+        quantization_config=quantization_config,
+    )
 
+    kroncker_model = replace_linears_with_kron(model,compression={'attention': 4.0, 'ffn': 8.0, 'head': 2.0})
     # Load teacher model
     teacher_model = AutoModelForCausalLM.from_pretrained(
         training_args.teacher_model_name_or_path,
@@ -104,6 +116,7 @@ if __name__ == "__main__":
         device_map=get_kbit_device_map() if quantization_config is not None else None,
         quantization_config=quantization_config,
     )
+    
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -119,19 +132,23 @@ if __name__ == "__main__":
     ################
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
 
-    with PartialState().local_main_process_first():
-        dataset = dataset.map(
-            lambda x: {
-                "prompt": tokenizer.apply_chat_template(x["prompt"], tokenize=False, add_generation_prompt=True)
-            },
-            num_proc=training_args.dataset_num_proc,
-        )
+    # with PartialState().local_main_process_first():
+    #     dataset = dataset.map(
+    #         lambda x: {
+    #             "prompt": tokenizer.apply_chat_template(x["prompt"], tokenize=False, add_generation_prompt=True)
+    #         },
+    #         num_proc=training_args.dataset_num_proc,
+    #     )
+
+    training_args.beta = 0
+    training_args.lmbda =0
+    
 
     ################
     # Training
     ################
     trainer = GKDTrainer(
-        model=model_args.model_name_or_path,
+        model=kroncker_model,
         teacher_model=training_args.teacher_model_name_or_path,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],

@@ -20,7 +20,7 @@ DEFAULT_BLOCK_N = 64
 @triton.jit
 def linear_kernel(
     x_ptr, a_kron_factor_ptr, b_kron_factor_ptr, bias_ptr, out_ptr,
-    M, K, N, b_Kron_factor_N, b_Kron_factor_K, 
+    M, K, N, b_Kron_factor_N:tl.constexpr, b_Kron_factor_K:tl.constexpr, 
     sxm, sxk,
     sak, san, # strides for a_kron_factor.transpose
     sbk,sbn,  # strides for b_kron_factor.transpose
@@ -47,9 +47,9 @@ def linear_kernel(
     a_kron_factor_N = N//b_Kron_factor_N
     a_kron_factor_K = K//b_Kron_factor_K
 
-    offs_b_kron_factor_n = pid_n + tl.arange(0, b_kron_factor_BLOCK_N)
+    offs_b_kron_factor_n = pid_n + tl.arange(0, b_Kron_factor_N)
     offs_a_kron_factor_n = pid_n + tl.arange(0, a_kron_factor_BLOCK_N)
-    offs_b_kron_factor_k = tl.arange(0, b_kron_factor_BLOCK_K)
+    offs_b_kron_factor_k = tl.arange(0, b_Kron_factor_K)
    
     
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
