@@ -84,16 +84,14 @@ def replace_linears_with_kron(
     model: PreTrainedModel,
     compression: dict = None,
     *,
-    prefer_smaller_b: bool = False
+    prefer_smaller_b: bool = True
 ) -> PreTrainedModel :
     """
     1) Collect all nn.Linear modules.
     2) Decide which compression factor to use (you can replace *all* linears if you like).
     3) Compute kron factors, build the KroneckerLinear, and swap it in.
     """
-    model = copy.deepcopy(model)
 
-    compression = compression or {'attention': 4.0, 'ffn': 8.0, 'head': 2.0}
 
     # 1) collect
     to_replace = []
@@ -131,6 +129,7 @@ def replace_linears_with_kron(
             )
             parent, attr = _get_parent_and_attr(model, name)
             setattr(parent, attr, kron)
+    
     return model
 
 def main():
