@@ -5,22 +5,28 @@ import math
 from typing import Optional, Tuple
 import torch.nn as nn
 # Default tile sizes for grid computation
-DEFAULT_BLOCK_M = 128
-DEFAULT_BLOCK_N = 64
-
+import os
+os.environ["TRITON_INTERPRET"]="0"
 # Autotuning configurations
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
-        triton.Config({'BLOCK_M': 512, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        # triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        # triton.Config({'BLOCK_M': 512, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=3, num_warps=4),
+        # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        # triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=5, num_warps=8),
+        # triton.Config({'BLOCK_M': 512, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=5, num_warps=8)
     ],
     key=['M', 'N', 'K']
 )
 @triton.jit
 def linear_kernel(
     x_ptr, a_kron_factor_ptr, b_kron_factor_ptr, bias_ptr, out_ptr,
-    M, K, N, b_Kron_factor_N:tl.constexpr, b_Kron_factor_K:tl.constexpr, 
+    M, K, N, 
+    B_KRON_FACTOR_BLOCK_N:tl.constexpr, B_KRON_FACTOR_BLOCK_K:tl.constexpr, #here we assume that B is one block
+    A_KRON_FACTOR_N:tl.constexpr, A_KRON_FACTOR_K:tl.constexpr,
+    #A_KRON_FACTOR_BLOCK_N:tl.constexpr, A_KRON_FACTOR_BLOCK_K:tl.constexpr,
     sxm, sxk,
     sak, san, # strides for a_kron_factor.transpose
     sbk,sbn,  # strides for b_kron_factor.transpose
@@ -33,57 +39,80 @@ def linear_kernel(
 
 
 
+   
+  
+    A_KRON_FACTOR_BLOCK_N: tl.constexpr = BLOCK_N // B_KRON_FACTOR_BLOCK_N
+    A_KRON_FACTOR_BLOCK_K: tl.constexpr = BLOCK_K // B_KRON_FACTOR_BLOCK_K
+
+    # a_kron_factor_N = N//b_Kron_factor_N
+    # a_kron_factor_K = K//b_Kron_factor_K
+
+
     #import pdb; pdb.set_trace()
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    b_kron_factor_BLOCK_N = b_Kron_factor_N
-    b_kron_factor_BLOCK_K = b_Kron_factor_K
-    a_kron_factor_BLOCK_N = BLOCK_N//b_kron_factor_BLOCK_N
-    a_kron_factor_BLOCK_K = BLOCK_K//b_kron_factor_BLOCK_K
 
-    a_kron_factor_N = N//b_Kron_factor_N
-    a_kron_factor_K = K//b_Kron_factor_K
-
-    offs_b_kron_factor_n = pid_n + tl.arange(0, b_Kron_factor_N)
-    offs_a_kron_factor_n = pid_n + tl.arange(0, a_kron_factor_BLOCK_N)
-    offs_b_kron_factor_k = tl.arange(0, b_Kron_factor_K)
+    
+    offs_a_kron_factor_n = pid_n * A_KRON_FACTOR_BLOCK_N + tl.arange(0, A_KRON_FACTOR_BLOCK_N)
+    offs_b_kron_factor_n =  tl.arange(0, B_KRON_FACTOR_BLOCK_N) #pid_n +
+    offs_b_kron_factor_k = tl.arange(0, B_KRON_FACTOR_BLOCK_K)
    
     
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
         offs_k = k + tl.arange(0, BLOCK_K)
-        offs_a_kron_factor_k = tl.arange(0, a_kron_factor_BLOCK_K)
-
+        base_col = (k // BLOCK_K) * A_KRON_FACTOR_BLOCK_K
+        offs_a_kron_factor_k = base_col + tl.arange(0, A_KRON_FACTOR_BLOCK_K)
+        
         x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_k[None, :] * sxk,
                     mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
         
-        b_kron_factor = tl.load(b_kron_factor_ptr + offs_b_kron_factor_n[:, None] * sbn + offs_b_kron_factor_k[None, :] * sbk,
-                                mask=(offs_b_kron_factor_n[None, :] < b_Kron_factor_N) & (offs_b_kron_factor_k[:, None] < b_Kron_factor_K), other=0.0)
+        b_blk = tl.load(b_kron_factor_ptr + offs_b_kron_factor_n[:, None] * sbn + offs_b_kron_factor_k[None, :] * sbk,
+                                mask=(offs_b_kron_factor_n[:, None] < B_KRON_FACTOR_BLOCK_N) & (offs_b_kron_factor_k[None, :] < B_KRON_FACTOR_BLOCK_K), other=0.0, cache_modifier='.ca')
         
 
-        a_kron_factor = tl.load(a_kron_factor_ptr + offs_a_kron_factor_n[:, None] * san + offs_a_kron_factor_k[None, :] * sak,
-                                mask=(offs_a_kron_factor_n[None, :] < a_kron_factor_N) & (offs_a_kron_factor_k[:, None] < a_kron_factor_K), other=0.0)
+        a_blk = tl.load(a_kron_factor_ptr + offs_a_kron_factor_n[:, None] * san + offs_a_kron_factor_k[None, :] * sak,
+                                mask=(offs_a_kron_factor_n[:, None] < A_KRON_FACTOR_N) & (offs_a_kron_factor_k[None, :] < A_KRON_FACTOR_K), other=0.0, cache_modifier='.ca')
         
         # Initialize accumulator for Kronecker product
-        kron_result = tl.zeros((a_kron_factor_BLOCK_N * b_kron_factor_BLOCK_N, a_kron_factor_BLOCK_K * b_kron_factor_BLOCK_K), dtype=tl.float32)
+        #kron_result = tl.zeros((A_KRON_FACTOR_BLOCK_N * B_KRON_FACTOR_BLOCK_N, A_KRON_FACTOR_BLOCK_K * B_KRON_FACTOR_BLOCK_K), dtype=tl.float32)
         
         # Compute Kronecker product
-        for i in range(a_kron_factor_BLOCK_N):
-            for j in range(a_kron_factor_BLOCK_K):
-                for p in range(b_kron_factor_BLOCK_N):
-                    for q in range(b_kron_factor_BLOCK_K):
-                        row_idx = i * b_kron_factor_BLOCK_N + p
-                        col_idx = j * b_kron_factor_BLOCK_K + q
-                        kron_result[row_idx, col_idx] = a_kron_factor[i, j] * b_kron_factor[p, q]
+        # for i in range(A_KRON_FACTOR_BLOCK_N):
+        #     for j in range(A_KRON_FACTOR_BLOCK_K):
+        #         for p in range(B_KRON_FACTOR_BLOCK_N):
+        #             for q in range(B_KRON_FACTOR_BLOCK_K):
+        #                 row_idx = i * B_KRON_FACTOR_BLOCK_N + p
+        #                 col_idx = j * B_KRON_FACTOR_BLOCK_K + q
+        #                 kron_result[row_idx, col_idx] = a_kron_factor[i, j] * b_kron_factor[p, q]
 
         
-        #w = tl.load(w_ptr + offs_n[None, :] * swn + offs_k[:, None] * swk,
-        #            mask=(offs_n[None, :] < N) & (offs_k[:, None] < K), other=0.0)
-        acc += tl.dot(x, kron_result)
+    
+        # after loading a_blk and b_blk with corrected masks:
+        # a_blk: (ANb, AKb)
+        # b_blk: (BNb, BKb)
 
+        # 1) lift dims & broadcast
+        a4 = tl.reshape(a_blk, (A_KRON_FACTOR_BLOCK_N, 1,
+                                A_KRON_FACTOR_BLOCK_K, 1))
+        b4 = tl.reshape(b_blk, (1, B_KRON_FACTOR_BLOCK_N,
+                                1, B_KRON_FACTOR_BLOCK_K))
+        k4 = a4 * b4  # → (ANb,BNb,AKb,BKb)
+
+        # permute to (AKb, BKb, ANb, BNb)
+        k4_t = tl.trans(k4, (2, 3, 0, 1))
+        # now flatten into (AKb*BKb, ANb*BNb)
+        kron_mat = tl.reshape(
+            k4_t,
+            (A_KRON_FACTOR_BLOCK_K * B_KRON_FACTOR_BLOCK_K,
+             A_KRON_FACTOR_BLOCK_N * B_KRON_FACTOR_BLOCK_N)
+        )
+        # dot: x is (BLOCK_M, BLOCK_K), kron_mat is (BLOCK_K, BLOCK_N)
+        acc += tl.dot(x, kron_mat)
+       
 
     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
     acc += bias[None, :]
@@ -97,13 +126,19 @@ def efficient_kronecker_linear(x, a_kron_factor,b_kron_factor, bias):
     """Launch Triton linear kernel"""
     M, K = x.shape
     N = a_kron_factor.shape[1] * b_kron_factor.shape[1]
-    b_Kron_factor_N = b_kron_factor.shape[0] 
-    b_Kron_factor_K = b_kron_factor.shape[1]  
+    b_kron_factor_N = b_kron_factor.shape[0] 
+    b_kron_factor_K = b_kron_factor.shape[1]  
+
+    a_kron_factor_N = a_kron_factor.shape[0]
+    a_kron_factor_K = a_kron_factor.shape[1]
+
     out = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    grid = (triton.cdiv(M, DEFAULT_BLOCK_M), triton.cdiv(N, DEFAULT_BLOCK_N))
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
     linear_kernel[grid](
         x, a_kron_factor, b_kron_factor, bias, out,
-        M, K, N, b_Kron_factor_N, b_Kron_factor_K,
+        M, K, N,
+        b_kron_factor_N, b_kron_factor_K,
+        a_kron_factor_N, a_kron_factor_K,
         x.stride(0), x.stride(1),
         a_kron_factor.stride(1), a_kron_factor.stride(0),
         b_kron_factor.stride(1), b_kron_factor.stride(0),
@@ -118,6 +153,7 @@ class TritonKroneckerLinearFunction(torch.autograd.Function):
     def forward(ctx, x, a_kron_factor, b_kron_factor, bias):
         ctx.save_for_backward(x, a_kron_factor, b_kron_factor)
         return efficient_kronecker_linear(x, a_kron_factor, b_kron_factor, bias)
+    
     @staticmethod
     def backward(ctx, grad_out):
         raise NotImplementedError("Backward for TritonKroneckerLinear not yet implemented")
@@ -174,7 +210,17 @@ class TritonKroneckerLinear(torch.nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x):
-        return TritonKroneckerLinearFunction.apply(x, self.kn_factor_A, self.kn_factor_B , self.bias)
+        # Check if we're running on CPU and issue warning
+        if not x.is_cuda and hasattr(torch, 'has_triton') and torch.has_triton():
+            print("Warning: Input tensor is on CPU, but Triton requires CUDA tensors.")
+            print("Moving tensors to CUDA if available, otherwise using fallback implementation.")
+            if torch.cuda.is_available():
+                x = x.cuda()
+                self.kn_factor_A = self.kn_factor_A.cuda()
+                self.kn_factor_B = self.kn_factor_B.cuda()
+                self.bias = self.bias.cuda() if self.bias is not None else None
+        
+        return TritonKroneckerLinearFunction.apply(x, self.kn_factor_A, self.kn_factor_B, self.bias)
 
 
 
@@ -187,61 +233,102 @@ class TritonKroneckerLinear(torch.nn.Module):
         import time
         import torch
         
+        # Check if CUDA is available
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if device.type == 'cpu':
+            print("Warning: CUDA not available. Triton requires CUDA tensors. Benchmark may fail.")
+            return
+            
         # Set random seed for reproducibility
         torch.manual_seed(42)
         
         # Test dimensions
-        in_features = 100
-        out_features = 100
-        batch_size = 32
-        
-        # Create random input
-        x = torch.randn(batch_size, in_features)
-        
-        # Method 1: Using KroneckerLinear
-        kron_linear = TritonKroneckerLinear(
-            in_features=in_features,
-            out_features=out_features,
-            in_factors=(50, 2),
-            out_factors=(50, 2),
-            bias=True
-        )
-        
-        # Method 2: Using standard linear with Kronecker product
-        # Create random factors
-        m1, n1 = kron_linear.out_factor1, kron_linear.in_factor1
-        m2, n2 = kron_linear.out_factor2, kron_linear.in_factor2
-        
-        A = kron_linear.kn_factor_A.view(m1, n1)
-        B = kron_linear.kn_factor_B.view(m2, n2)
-        
-        # Compute full weight matrix using Kronecker product
-        W = torch.kron(A, B)
-        linear = torch.nn.Linear(in_features, out_features)
-        linear.weight.data = W
-        
-        # Benchmark KroneckerLinear
-        start_time = time.time()
-        for _ in range(100):
-            y1 = kron_linear(x)
-        kron_time = (time.time() - start_time) / 100
-        
-        # Benchmark standard linear
-        start_time = time.time()
-        for _ in range(100):
-            y2 = linear(x)
-        linear_time = (time.time() - start_time) / 100
-        
-        # Compare outputs to ensure they are acceptably close
-        max_diff = torch.max(torch.abs(y1 - y2))
-        print(f"Maximum difference between outputs: {max_diff:.6f}")
-        print(f"KroneckerLinear time: {kron_time:.6f}s")
-        print(f"Standard linear time: {linear_time:.6f}s")
-        print(f"Speedup factor: {linear_time/kron_time:.2f}x")
+        dimensions = [
+            (512, 512),
+            (1024, 1024),
+            (2048, 2048),
+            (4096, 4096),
+            (9192, 9192)
+        ]
+        batch_size = 256
+
+        print("\nBenchmarking different matrix dimensions:")
+        print("-" * 50)
+        print(f"{'Size':>10} {'KronTime':>12} {'LinearTime':>12} {'Speedup':>10} {'MaxDiff':>10}")
+        print("-" * 50)
+
+        # Test different kron_b factors
+        kron_b_factors = [2, 4, 8]
+
+        for in_features, out_features in dimensions:
+            for kron_b in kron_b_factors:
+                # Create random input
+                x = torch.randn(batch_size, in_features, device=device)
+                
+                # Method 1: Using KroneckerLinear
+                # Calculate complementary factor for kron_b
+                kron_a = in_features // kron_b
+                
+                kron_linear = TritonKroneckerLinear(
+                    in_features=in_features,
+                    out_features=out_features,
+                    in_factors=(kron_a, kron_b),
+                    out_factors=(kron_a, kron_b),
+                    bias=True,
+                    device=device
+                )
+                
+                # Method 2: Using standard linear with Kronecker product
+                m1, n1 = kron_linear.out_factor1, kron_linear.in_factor1
+                m2, n2 = kron_linear.out_factor2, kron_linear.in_factor2
+                
+                A = kron_linear.kn_factor_A.view(m1, n1)
+                B = kron_linear.kn_factor_B.view(m2, n2)
+                
+                # Compute full weight matrix using Kronecker product
+                W = torch.kron(A, B)
+                linear = torch.nn.Linear(in_features, out_features, device=device)
+                linear.weight.data = W
+                linear.bias.data = kron_linear.bias.data
+
+                try:
+                    # Warmup runs
+                    for _ in range(10):
+                        y1 = kron_linear(x)
+                        y2 = linear(x)
+                        
+                    # Benchmark KroneckerLinear with compiled forward
+                    kron_linear_compiled = torch.compile(kron_linear)
+                    torch.cuda.synchronize()
+                    start_time = time.time()
+                    for _ in range(100):
+                        y1 = kron_linear(x)
+                    torch.cuda.synchronize() 
+                    kron_time = (time.time() - start_time) / 100
+
+                    # Benchmark standard linear with compiled forward
+                    linear_compiled = torch.compile(linear)
+                    torch.cuda.synchronize()
+                    start_time = time.time()
+                    for _ in range(100):
+                        y2 = linear(x)
+                    torch.cuda.synchronize()
+                    linear_time = (time.time() - start_time) / 100
+                    
+                    # Compare outputs
+                    max_diff = torch.max(torch.abs(y1 - y2))
+                    speedup = linear_time/kron_time
+
+                    print(f"{in_features:>10} {kron_time:>12.6f} {linear_time:>12.6f} {speedup:>10.2f} {max_diff:>10.6f}")
+                    print(f"Kron_b factor: {kron_b}")
+                except Exception as e:
+                    print(f"Error during benchmark: {e}")
+                    print("Try using KroneckerLinear implementation instead of TritonKroneckerLinear")
 
 def __main__():
     TritonKroneckerLinear.benchmark_kronecker_linear()
 
 if __name__ == "__main__":
     __main__()
+
 
