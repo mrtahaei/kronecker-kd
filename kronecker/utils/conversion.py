@@ -3,13 +3,7 @@ import math
 import torch
 from torch import nn
 from transformers import PreTrainedModel, AutoModelForCausalLM, AutoTokenizer
-from kronecker.layers.kronecker_linear import KroneckerLinear
-#!/usr/bin/env python
-import math
-import torch
-from torch import nn
-from transformers import AutoModelForCausalLM, PreTrainedModel, AutoTokenizer
-from kronecker.layers.kronecker_linear import KroneckerLinear
+from kronecker.layers.kronecker_triton_kernel import KroneckerLinear
 import copy
 
 

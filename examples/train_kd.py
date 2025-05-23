@@ -63,7 +63,7 @@ from trl import (
     get_quantization_config,
 )
 
-
+from examples.custom_gkd_trainer import CustomGKDTrainer
 if __name__ == "__main__":
     parser = TrlParser((ScriptArguments, GKDConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
@@ -131,6 +131,12 @@ if __name__ == "__main__":
     # Dataset
     ################
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    
+    # Debug: Print dataset structure
+    print("Dataset loaded successfully. Structure:", dataset)
+    print("Available splits:", list(dataset.keys())) 
+    print("Dataset train split:", script_args.dataset_train_split)
+    print("Dataset test split:", script_args.dataset_test_split)
 
     # with PartialState().local_main_process_first():
     #     dataset = dataset.map(
@@ -147,21 +153,21 @@ if __name__ == "__main__":
     ################
     # Training
     ################
-    trainer = GKDTrainer(
+    trainer = CustomGKDTrainer(
         model=kroncker_model,
         teacher_model=training_args.teacher_model_name_or_path,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        processing_class=tokenizer,
-        peft_config=get_peft_config(model_args),
+        processing_class=tokenizer        
     )
+    #peft_config=get_peft_config(model_args),
 
     if training_args.eval_strategy != "no":
         generation_config = GenerationConfig(
             max_new_tokens=training_args.max_new_tokens, do_sample=True, temperature=training_args.temperature
         )
-        completions_callback = LogCompletionsCallback(trainer, generation_config, num_prompts=8)
+        completions_callback = LogCompletionsCallback(trainer, generation_config, num_prompts=40)
         trainer.add_callback(completions_callback)
 
     trainer.train()
