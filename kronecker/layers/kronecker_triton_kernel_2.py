@@ -2,175 +2,136 @@ import triton
 import triton.language as tl
 import torch
 import math
-from typing import Optional, Tuple
+from typing import Tuple, List, Optional
 import torch.nn as nn
-# Default tile sizes for grid computation
-import os
-#os.environ["TRITON_INTERPRET"]="1"
-# Autotuning configurations
+
+############################################
+#  Triton Kronecker Linear – B‑factor tiny  #
+############################################
+#  Assumption:  B_K ≤ 16  (fits in registers/L1), so we can
+#  cache **entire B** for each kernel and reuse across K‑loop.
+############################################
+
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        # triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
-        # triton.Config({'BLOCK_M': 512, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
-        # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=3, num_warps=4),
-        # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        # triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=5, num_warps=8),
-        # triton.Config({'BLOCK_M': 512, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=5, num_warps=8)
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 128}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32, 'BLOCK_K': 64}, num_stages=3, num_warps=2),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 16, 'BLOCK_K': 32}, num_stages=2, num_warps=2),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 16, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 16, 'BLOCK_K': 32}, num_stages=2, num_warps=2),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=2, num_warps=2),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 16, 'BLOCK_K': 32}, num_stages=2, num_warps=2),
     ],
-    key=['M', 'N', 'K']
+    key=["M","N","K"]
 )
 @triton.jit
-def linear_kernel(
-    x_ptr, a_kron_factor_ptr, b_kron_factor_ptr, bias_ptr, out_ptr,
-    M, K, N, 
-    B_KRON_FACTOR_BLOCK_N:tl.constexpr, B_KRON_FACTOR_BLOCK_K:tl.constexpr, #here we assume that B is one block
-    A_KRON_FACTOR_N:tl.constexpr, A_KRON_FACTOR_K:tl.constexpr,
-    #A_KRON_FACTOR_BLOCK_N:tl.constexpr, A_KRON_FACTOR_BLOCK_K:tl.constexpr,
-    sxm, sxk,
-    sak, san, # strides for a_kron_factor.transpose
-    sbk,sbn,  # strides for b_kron_factor.transpose
-    sb, # stride for bias
-    som, son,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+def kron_linear_kernel(
+    x_ptr, a_ptr, b_ptr, bias_ptr, out_ptr,
+    M, K, N,
+    A_N: tl.constexpr, A_K: tl.constexpr,
+    B_N: tl.constexpr, B_K: tl.constexpr,
+    sxm, sxk,        # X strides
+    sak, san,        # A strides (row‑major: (A_N, A_K))
+    sbk, sbn,        # B strides (row‑major: (B_N, B_K))
+    sb,              # bias stride
+    som, son,        # Y strides
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
+    """Y = X · (A ⊗ B) + bias.  Optimised for **small B**.
+    Strategy:
+    • Cache the full B (B_N×B_K) in registers once per kernel (fits since B_K small).
+    • Iterate over A_K blocks inside the K‑loop, broadcasting B.
+    """
+    tl.static_assert(B_K <= 16, "This variant targets very small B_K (≤16)")
+    tl.static_assert(BLOCK_K % B_K == 0, "BLOCK_K must be multiple of B_K")
 
-
-
-   
-  
-    A_KRON_FACTOR_BLOCK_N: tl.constexpr = BLOCK_N // B_KRON_FACTOR_BLOCK_N
-    A_KRON_FACTOR_BLOCK_K: tl.constexpr = BLOCK_K // B_KRON_FACTOR_BLOCK_K
-
-    # a_kron_factor_N = N//b_Kron_factor_N
-    # a_kron_factor_K = K//b_Kron_factor_K
-
-
-    #import pdb; pdb.set_trace()
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # rows in X/Y
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # cols in Y
 
-    
-    offs_a_kron_factor_n = pid_n * A_KRON_FACTOR_BLOCK_N + tl.arange(0, A_KRON_FACTOR_BLOCK_N)
-    offs_b_kron_factor_n =  tl.arange(0, B_KRON_FACTOR_BLOCK_N) #pid_n +
-    offs_b_kron_factor_k = tl.arange(0, B_KRON_FACTOR_BLOCK_K)
-   
-    
+    # factor row/col indices for this N‑tile
+    a_row_idx = offs_n // B_N   # (BN_tile,)  idx over A_N
+    b_row_idx = offs_n %  B_N   # idx over B_N
+
+    # ---- cache full B in registers (small) ----
+    B_full = tl.load(b_ptr + b_row_idx[None, :] * sbn + tl.arange(0, B_K)[:, None] * sbk,
+                     cache_modifier='.ca')            # (B_K , BN_tile)
+
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, K, BLOCK_K):
-        offs_k = k + tl.arange(0, BLOCK_K)
-        base_col = (k // BLOCK_K) * A_KRON_FACTOR_BLOCK_K
-        offs_a_kron_factor_k = base_col + tl.arange(0, A_KRON_FACTOR_BLOCK_K)
-        
-        x_blk = tl.load(x_ptr + offs_m[:, None] * sxm + offs_k[None, :] * sxk,
-                    mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
-        
-        b_blk = tl.load(b_kron_factor_ptr + offs_b_kron_factor_n[:, None] * sbn + offs_b_kron_factor_k[None, :] * sbk,
-                                mask=(offs_b_kron_factor_n[:, None] < B_KRON_FACTOR_BLOCK_N) & (offs_b_kron_factor_k[None, :] < B_KRON_FACTOR_BLOCK_K), other=0.0, cache_modifier='.ca')
-        
 
-        a_blk = tl.load(a_kron_factor_ptr + offs_a_kron_factor_n[:, None] * san + offs_a_kron_factor_k[None, :] * sak,
-                                mask=(offs_a_kron_factor_n[:, None] < A_KRON_FACTOR_N) & (offs_a_kron_factor_k[None, :] < A_KRON_FACTOR_K), other=0.0, cache_modifier='.ca')
-        
-                
-        # # 1) fold K into (M·A_Kb, B_Kb)
-        # x1 = tl.reshape(
-        #     x_blk,
-        #     (BLOCK_M * A_KRON_FACTOR_BLOCK_K,
-        #     B_KRON_FACTOR_BLOCK_K)
-        # )
+    # Iterate over A_K in tiles of size AK_STEP (= BLOCK_K//B_K)
+    AK_STEP: tl.constexpr = BLOCK_K // B_K
+    for ak_offset in range(0, A_K, AK_STEP):
+        # Slice A rows needed for this tile
+        a_col_slice = ak_offset + tl.arange(0, AK_STEP)            # length = AK_STEP
 
-        # # 2) (M·A_Kb, B_Kb) × (B_Kb, B_Nb) → (M·A_Kb, B_Nb)
-        # b_blk_t = tl.trans(b_blk, (1, 0))    # swap dim0↔dim1
+        # load A_sub (AK_STEP × BN_tile)
+        A_sub = tl.load(a_ptr + a_row_idx[None, :] * san + a_col_slice[:, None] * sak,
+                        cache_modifier='.ca')        # (AK_STEP , BN_tile)
 
-        # tmp = tl.dot(x1, b_blk_t)
+        # Build kron tile on‑the‑fly via outer‑product broadcast
+        # kron_mat shape: (AK_STEP*B_K , BN_tile)
+        a4 = tl.reshape(A_sub, (AK_STEP, 1, BLOCK_N))  # (AK_STEP,1,BN_tile)
+        b4 = tl.reshape(B_full, (1, B_K, BLOCK_N))     # (1,BK,BN_tile)
+        kron_block = tl.reshape(a4 * b4, (AK_STEP * B_K, BLOCK_N))
 
-        # # 3) reshape & permute to (M, B_Nb, A_Kb)
-        # tmp2 = tl.reshape(tmp, (BLOCK_M, A_KRON_FACTOR_BLOCK_K, B_KRON_FACTOR_BLOCK_N))
-        # tmp3 = tl.trans(tmp2, (0, 2, 1))
+        # Corresponding K indices in X
+        k_idx = ak_offset * B_K + tl.arange(0, AK_STEP * B_K)
+        x_blk = tl.load(x_ptr + offs_m[:, None] * sxm + k_idx[None, :] * sxk,
+                        mask=(offs_m[:, None] < M) & (k_idx[None, :] < K), other=0.)
 
-        # # 4) fold into (M·B_Nb, A_Kb)
-        # tmp4 = tl.reshape(tmp3, (BLOCK_M * B_KRON_FACTOR_BLOCK_N,
-        #                         A_KRON_FACTOR_BLOCK_K))
+        acc += tl.dot(x_blk, kron_block)
 
-        # # 5) (M·B_Nb, A_Kb) × (A_Kb, A_Nb) → (M·B_Nb, A_Nb)
-        # out4 = tl.dot(tmp4, tl.trans(a_blk))
+    # bias + store
+    bias_vec = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.)
+    acc += bias_vec[None, :]
 
-        # # 6) back to (M, N) and accumulate
-        # out_blk = tl.reshape(out4,
-        #     (BLOCK_M,
-        #     B_KRON_FACTOR_BLOCK_N * A_KRON_FACTOR_BLOCK_N)
-        # )
-        # acc += out_blk
-
-
-        # after loading a_blk and b_blk with corrected masks:
-        # a_blk: (ANb, AKb)
-        # b_blk: (BNb, BKb)
-
-        # 1) lift dims & broadcast
-        a4 = tl.reshape(a_blk, (A_KRON_FACTOR_BLOCK_N, 1,
-                                A_KRON_FACTOR_BLOCK_K, 1))
-        b4 = tl.reshape(b_blk, (1, B_KRON_FACTOR_BLOCK_N,
-                                1, B_KRON_FACTOR_BLOCK_K))
-        k4 = a4 * b4  # → (ANb,BNb,AKb,BKb)
-
-        # permute to (AKb, BKb, ANb, BNb)
-        k4_t = tl.trans(k4, (2, 3, 0, 1))
-        # now flatten into (AKb*BKb, ANb*BNb)
-        kron_mat = tl.reshape(
-            k4_t,
-            (A_KRON_FACTOR_BLOCK_K * B_KRON_FACTOR_BLOCK_K,
-             A_KRON_FACTOR_BLOCK_N * B_KRON_FACTOR_BLOCK_N)
-        )
-        # dot: x is (BLOCK_M, BLOCK_K), kron_mat is (BLOCK_K, BLOCK_N)
-        acc += tl.dot(x_blk, kron_mat)
-       
-
-    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    acc += bias[None, :]
     tl.store(out_ptr + offs_m[:, None] * som + offs_n[None, :] * son,
              acc,
              mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
+# ───────────────────────── Python wrapper ─────────────────────────
 
-
-def efficient_kronecker_linear(x, a_kron_factor,b_kron_factor, bias):
-    """Launch Triton linear kernel"""
+def kron_linear_forward(x, A, B, bias):
     M, K = x.shape
-    N = a_kron_factor.shape[1] * b_kron_factor.shape[1]
-    b_kron_factor_N = b_kron_factor.shape[0] 
-    b_kron_factor_K = b_kron_factor.shape[1]  
-
-    a_kron_factor_N = a_kron_factor.shape[0]
-    a_kron_factor_K = a_kron_factor.shape[1]
-
+    A_N, A_K = A.shape
+    B_N, B_K = B.shape
+    N = A_N * B_N
     out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
-    linear_kernel[grid](
-        x, a_kron_factor, b_kron_factor, bias, out,
+
+    kron_linear_kernel[grid](
+        x, A, B, bias, out,
         M, K, N,
-        b_kron_factor_N, b_kron_factor_K,
-        a_kron_factor_N, a_kron_factor_K,
+        A_N, A_K, B_N, B_K,
         x.stride(0), x.stride(1),
-        a_kron_factor.stride(1), a_kron_factor.stride(0),
-        b_kron_factor.stride(1), b_kron_factor.stride(0),
+        A.stride(1), A.stride(0),
+        B.stride(1), B.stride(0),
         bias.stride(0),
         out.stride(0), out.stride(1)
     )
+    #print(kron_linear_kernel.best_config)
     return out
+
+
+
 
 
 class TritonKroneckerLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, a_kron_factor, b_kron_factor, bias):
         ctx.save_for_backward(x, a_kron_factor, b_kron_factor)
-        return efficient_kronecker_linear(x, a_kron_factor, b_kron_factor, bias)
+        return kron_linear_forward(x, a_kron_factor, b_kron_factor, bias)
     
     @staticmethod
     def backward(ctx, grad_out):
@@ -348,5 +309,3 @@ def __main__():
 
 if __name__ == "__main__":
     __main__()
-
-

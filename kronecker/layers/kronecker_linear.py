@@ -173,7 +173,11 @@ class KroneckerLinear(nn.Module):
         """
         # Rearrange weight from (m1*m2, n1*n2) to (m1*n1, m2*n2)
         R = weight.view(m1, m2, n1, n2).permute(0, 2, 1, 3).contiguous().view(m1 * n1, m2 * n2)
-        U, S, Vh = torch.linalg.svd(R, full_matrices=False)
+        # Convert to float32 for SVD, then back to original dtype
+        orig_dtype = R.dtype
+        R_f32 = R.to(torch.float32)
+        U, S, Vh = torch.linalg.svd(R_f32, full_matrices=False)
+        U, S, Vh = U.to(orig_dtype), S.to(orig_dtype), Vh.to(orig_dtype)
         components = min(num_sum, S.size(0))
         A_factors = []
         B_factors = []
