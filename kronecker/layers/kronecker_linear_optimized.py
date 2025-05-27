@@ -2,163 +2,101 @@ import triton
 import triton.language as tl
 import torch
 import math
-from typing import Tuple, List, Optional
+from typing import Optional, Tuple
 import torch.nn as nn
 
-############################################
-#  Triton Kronecker Linear – B‑factor tiny  #
-############################################
-#  Assumption:  B_K ≤ 16  (fits in registers/L1), so we can
-#  cache **entire B** for each kernel and reuse across K‑loop.
-############################################
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_stages=4, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_stages=4, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 128}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32, 'BLOCK_K': 64}, num_stages=3, num_warps=2),
-        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 16, 'BLOCK_K': 32}, num_stages=2, num_warps=2),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 16, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 16, 'BLOCK_K': 32}, num_stages=2, num_warps=2),
-        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=2, num_warps=2),
-        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 16, 'BLOCK_K': 32}, num_stages=2, num_warps=2),
-    ],
-    key=["M","N","K"]
-)
-@triton.jit
-def kron_linear_kernel(
-    x_ptr, a_ptr, b_ptr, bias_ptr, out_ptr,
-    M, K, N,
-    A_N: tl.constexpr, A_K: tl.constexpr,
-    B_N: tl.constexpr, B_K: tl.constexpr,
-    sxm, sxk,        # X strides
-    sak, san,        # A strides (row‑major: (A_N, A_K))
-    sbk, sbn,        # B strides (row‑major: (B_N, B_K))
-    sb,              # bias stride
-    som, son,        # Y strides
-    HAS_BIAS: tl.constexpr,  # Flag to indicate if bias should be added
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    """Y = X · (A ⊗ B) + bias.  Optimised for **small B**.
-    Strategy:
-    • Cache the full B (B_N×B_K) in registers once per kernel (fits since B_K small).
-    • Iterate over A_K blocks inside the K‑loop, broadcasting B.
+def efficient_kronecker_linear(x, a_kron_factor, b_kron_factor, bias):
     """
-    tl.static_assert(B_K <= 16, "This variant targets very small B_K (≤16)")
-    tl.static_assert(BLOCK_K % B_K == 0, "BLOCK_K must be multiple of B_K")
-
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # rows in X/Y
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # cols in Y
-
-    # factor row/col indices for this N‑tile
-    a_row_idx = offs_n // B_N   # (BN_tile,)  idx over A_N
-    b_row_idx = offs_n %  B_N   # idx over B_N
-
-    # ---- cache full B in registers (small) ----
-    B_full = tl.load(b_ptr + b_row_idx[None, :] * sbn + tl.arange(0, B_K)[:, None] * sbk,
-                     cache_modifier='.ca')            # (B_K , BN_tile)
-    b4 = tl.reshape(B_full, (1, B_K, BLOCK_N))     # (1,BK,BN_tile)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    # Iterate over A_K in tiles of size AK_STEP (= BLOCK_K//B_K)
-    AK_STEP: tl.constexpr = BLOCK_K // B_K
-    for ak_offset in range(0, A_K, AK_STEP):
-        # Slice A rows needed for this tile
-        a_col_slice = ak_offset + tl.arange(0, AK_STEP)            # length = AK_STEP
-
-        # load A_sub (AK_STEP × BN_tile)
-        A_sub = tl.load(a_ptr + a_row_idx[None, :] * san + a_col_slice[:, None] * sak,
-                        cache_modifier='.ca')        # (AK_STEP , BN_tile)
-
-        # Build kron tile on‑the‑fly via outer‑product broadcast
-        # kron_mat shape: (AK_STEP*B_K , BN_tile)
-        a4 = tl.reshape(A_sub, (AK_STEP, 1, BLOCK_N))  # (AK_STEP,1,BN_tile)
-        
-        kron_block = tl.reshape(a4 * b4, (AK_STEP * B_K, BLOCK_N))
-
-        # Corresponding K indices in X
-        k_idx = ak_offset * B_K + tl.arange(0, AK_STEP * B_K)
-        x_blk = tl.load(x_ptr + offs_m[:, None] * sxm + k_idx[None, :] * sxk,
-                        mask=(offs_m[:, None] < M) & (k_idx[None, :] < K), other=0.)
-
-        acc += tl.dot(x_blk, kron_block)
-
-    # bias + store
-    if HAS_BIAS:
-        bias_vec = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.)
-        acc += bias_vec[None, :]
-
-    tl.store(out_ptr + offs_m[:, None] * som + offs_n[None, :] * son,
-             acc,
-             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
-
-# ───────────────────────── Python wrapper ─────────────────────────
-
-def kron_linear_forward(x, A, B, bias):
+    Highly optimized Kronecker linear using the mathematical identity:
+    Y = X @ (A ⊗ B)^T
+    
+    Instead of materializing the Kronecker product, we use:
+    (A ⊗ B) @ vec(X) = vec(B @ X @ A^T)
+    
+    For matrix form: Y = X @ (A ⊗ B)^T
+    We reshape X to (M, A_K, B_K), then:
+    1. Apply B^T: temp = X @ B^T  -> (M, A_K, B_N)
+    2. Apply A^T: Y = temp @ A^T  -> (M, A_N * B_N)
+    
+    This is much faster as it avoids creating the full Kronecker product!
+    """
     M, K = x.shape
-    A_N, A_K = A.shape
-    B_N, B_K = B.shape
-    N = A_N * B_N
-    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
-
-    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
-
-    # Handle bias properly - create a dummy bias tensor if None
-    has_bias = bias is not None
-    if bias is None:
-        bias_ptr = torch.zeros(N, device=x.device, dtype=x.dtype)
-        bias_stride = bias_ptr.stride(0)
-    else:
-        bias_ptr = bias
-        bias_stride = bias.stride(0)
-
-    kron_linear_kernel[grid](
-        x, A, B, bias_ptr, out,
-        M, K, N,
-        A_N, A_K, B_N, B_K,
-        x.stride(0), x.stride(1),
-        A.stride(1), A.stride(0),
-        B.stride(1), B.stride(0),
-        bias_stride,
-        out.stride(0), out.stride(1),
-        has_bias
-    )
-    #print(kron_linear_kernel.best_config)
-    return out
-
-
-
+    A_N, A_K = a_kron_factor.shape
+    B_N, B_K = b_kron_factor.shape
+    
+    assert K == A_K * B_K, f"Input dimension mismatch: {K} != {A_K} * {B_K}"
+    
+    # Reshape input to separate A and B dimensions
+    x_reshaped = x.view(M, A_K, B_K)  # (M, A_K, B_K)
+    
+    # Step 1: Apply B^T to the last dimension using optimized matmul
+    # x_reshaped: (M, A_K, B_K), B^T: (B_N, B_K)
+    # Result: (M, A_K, B_N)
+    temp = torch.matmul(x_reshaped, b_kron_factor.t())  # (M, A_K, B_N)
+    
+    # Step 2: Apply A^T to the middle dimension using optimized matmul
+    # temp: (M, A_K, B_N), A^T: (A_N, A_K)
+    # We need to contract over the A_K dimension
+    # temp.permute(0, 2, 1): (M, B_N, A_K)
+    # A^T: (A_N, A_K)
+    # Result: (M, B_N, A_N)
+    temp_perm = temp.permute(0, 2, 1)  # (M, B_N, A_K)
+    result_perm = torch.matmul(temp_perm, a_kron_factor.t())  # (M, B_N, A_N)
+    
+    # Reshape to (M, A_N * B_N)
+    # We need to interleave A_N and B_N properly to match Kronecker product layout
+    result = result_perm.permute(0, 2, 1).contiguous().view(M, A_N * B_N)
+    
+    # Add bias
+    if bias is not None:
+        result = result + bias
+    
+    return result
 
 
 class TritonKroneckerLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, a_kron_factor, b_kron_factor, bias):
         ctx.save_for_backward(x, a_kron_factor, b_kron_factor)
-        return kron_linear_forward(x, a_kron_factor, b_kron_factor, bias)
+        return efficient_kronecker_linear(x, a_kron_factor, b_kron_factor, bias)
     
     @staticmethod
     def backward(ctx, grad_out):
-        raise NotImplementedError("Backward for TritonKroneckerLinear not yet implemented")
-    # @staticmethod
-    # def backward(ctx, grad_out):
-    #     x, a_kron_factor, b_kron_factor = ctx.saved_tensors
-    #     grad_bias = grad_out.sum(dim=0)
-    #     grad_a_kron_factor = torch.matmul(grad_out.t(), x)
-    #     grad_b_kron_factor = torch.matmul(grad_out, a_kron_factor)
-    #     return grad_x, grad_weight, grad_bias
+        """
+        Memory‑friendly backward pass using the same mathematical identity
+        """
+        x, A, B = ctx.saved_tensors           # A: (A_N, A_K)   B: (B_N, B_K)
+        M, K      = x.shape
+        A_N, A_K  = A.shape
+        B_N, B_K  = B.shape
+        assert K == A_K * B_K, "K mismatch"
+
+        # ---------- grad_x -------------------------------------------------
+        # 1. shape grad_out -> (M, A_N, B_N)
+        gout_mpq = grad_out.view(M, A_N, B_N)          # m p q
+        # 2. contract over p with A  (A_N, A_K)
+        #       m p q , p k  -> m k q
+        tmp_mkq  = torch.einsum('mpq,pk->mkq', gout_mpq, A)  # (M, A_K, B_N)
+        # 3. contract over q with B  (B_N, B_K)
+        #       m k q , q l  -> m k l
+        x_grad_mkl = torch.einsum('mkq,ql->mkl', tmp_mkq, B) # (M, A_K, B_K)
+        grad_x = x_grad_mkl.reshape(M, K)                    # (M, K)
+
+        # ---------- grad_A -------------------------------------------------
+        x_mkl = x.view(M, A_K, B_K)                     # m k l
+        grad_A = torch.einsum('mkl,mpq,ql->pk', x_mkl, gout_mpq, B)  # (A_N, A_K)
+
+        # ---------- grad_B -------------------------------------------------
+        grad_B = torch.einsum('mkl,mpq,pk->ql', x_mkl, gout_mpq, A)  # (B_N, B_K)
+
+        # ---------- grad_bias ---------------------------------------------
+        grad_bias = grad_out.sum(dim=0)
+
+        return grad_x, grad_A, grad_B, grad_bias
 
 
-class TritonKroneckerLinear(torch.nn.Module):
-        
+class KroneckerLinear(torch.nn.Module):
     def __init__(
         self,
         in_features: int,
@@ -172,7 +110,6 @@ class TritonKroneckerLinear(torch.nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        
         
         # Validate that factors multiply to the correct dimensions
         if in_factors[0] * in_factors[1] != in_features:
@@ -212,8 +149,6 @@ class TritonKroneckerLinear(torch.nn.Module):
                 self.bias = self.bias.cuda() if self.bias is not None else None
         
         return TritonKroneckerLinearFunction.apply(x, self.kn_factor_A, self.kn_factor_B, self.bias)
-
-
 
     @staticmethod
     def benchmark_kronecker_linear():
@@ -260,7 +195,7 @@ class TritonKroneckerLinear(torch.nn.Module):
                 # Calculate complementary factor for kron_b
                 kron_a = in_features // kron_b
                 
-                kron_linear = TritonKroneckerLinear(
+                kron_linear = KroneckerLinear(
                     in_features=in_features,
                     out_features=out_features,
                     in_factors=(kron_a, kron_b),
@@ -284,7 +219,7 @@ class TritonKroneckerLinear(torch.nn.Module):
 
                 try:
                     # Warmup runs
-                    for _ in range(100):
+                    for _ in range(10):
                         y1 = kron_linear(x)
                         y2 = linear(x)
                         
@@ -316,8 +251,85 @@ class TritonKroneckerLinear(torch.nn.Module):
                     print(f"Error during benchmark: {e}")
                     print("Try using KroneckerLinear implementation instead of TritonKroneckerLinear")
 
-def __main__():
-    TritonKroneckerLinear.benchmark_kronecker_linear()
+
+def test_correctness():
+    """Test correctness of the optimized implementation"""
+    device = torch.device('cuda')
+    
+    # Simple test case
+    M, K = 32, 64  # Input: 32x64
+    A_N, A_K = 8, 16  # A: 8x16
+    B_N, B_K = 4, 4   # B: 4x4
+    
+    # Create test matrices
+    x = torch.randn(M, K, device=device)
+    A = torch.randn(A_N, A_K, device=device)
+    B = torch.randn(B_N, B_K, device=device)
+    bias = torch.randn(A_N * B_N, device=device)
+    
+    # Reference computation using torch.kron
+    W_ref = torch.kron(A, B)
+    y_ref = x @ W_ref.t() + bias
+    
+    # Our optimized computation
+    y_opt = efficient_kronecker_linear(x, A, B, bias)
+    
+    # Compare results
+    max_diff = torch.max(torch.abs(y_ref - y_opt))
+    print(f"Correctness test - Max difference: {max_diff:.10f}")
+    print(f"Shapes - Reference: {y_ref.shape}, Optimized: {y_opt.shape}")
+    print(f"All close (1e-5): {torch.allclose(y_ref, y_opt, atol=1e-5)}")
+    print(f"All close (1e-6): {torch.allclose(y_ref, y_opt, atol=1e-6)}")
+    
+    return max_diff < 1e-5
+
 
 if __name__ == "__main__":
-    __main__()
+    print("Testing correctness...")
+    if test_correctness():
+        print("✓ Correctness test passed!")
+        print("\nRunning benchmark...")
+        KroneckerLinear.benchmark_kronecker_linear()
+         # Set up input sizes
+        M, K = 2, 4
+        A_N, A_K = 2, 2
+        B_N, B_K = 2, 2
+
+        # Create double precision inputs
+        device = torch.device('cuda')
+        x = torch.randn(M, K, device=device, requires_grad=True)
+        A = torch.randn(A_N, A_K, device=device, requires_grad=True)
+        B = torch.randn(B_N, B_K, device=device, requires_grad=True)
+        bias = torch.randn(A_N * B_N, device=device, requires_grad=True)
+        # Forward with your custom function
+        y1 = TritonKroneckerLinearFunction.apply(x, A, B, bias)
+        breakpoint()
+        loss1 = y1.sum()
+        loss1.backward()
+        grad_x1 = x.grad.clone()
+        grad_A1 = A.grad.clone()
+        grad_B1 = B.grad.clone()
+        grad_bias1 = bias.grad.clone()
+
+        # Zero gradients
+        x.grad.zero_(); A.grad.zero_(); B.grad.zero_(); bias.grad.zero_()
+
+        # Forward with reference (e.g., using torch.kron)
+        W = torch.kron(A, B)
+        y2 = x @ W.t() + bias
+        breakpoint()
+        loss2 = y2.sum()
+        loss2.backward()
+        grad_x2 = x.grad.clone()
+        grad_A2 = A.grad.clone()
+        grad_B2 = B.grad.clone()
+        grad_bias2 = bias.grad.clone()
+
+        # Compare
+        print(torch.allclose(grad_x1, grad_x2, atol=1e-5))
+        print(torch.allclose(grad_A1, grad_A2, atol=1e-5))
+        print(torch.allclose(grad_B1, grad_B2, atol=1e-5))
+        print(torch.allclose(grad_bias1, grad_bias2, atol=1e-5))
+
+    else:
+        print("✗ Correctness test failed!") 
