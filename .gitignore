@@ -48,6 +48,9 @@ env/
 venv/
 ENV/
 
+# Training scripts with sensitive tokens
+scripts/train_kd.sh
+
 # Misc
 .DS_Store
 *.log
